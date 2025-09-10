@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced Budibase deployment script for OpenShift with resource quota support
-# Designed for users with limited privileges
+# Comprehensive Budibase deployment script for OpenShift
+# Fully automated with proper nginx permissions and resource limits
 
 # Color codes for output
 GREEN='\033[0;32m'
@@ -24,7 +24,7 @@ echo -e "${YELLOW}Auto-discovering cluster domain...${NC}"
 CLUSTER_DOMAIN=""
 
 # Try method 1: Find a route in any project the user can access
-for PROJECT in $(oc get projects -o name 2>/dev/null | cut -d'/' -f2); do
+for PROJECT in $(oc projects -o name 2>/dev/null | cut -d'/' -f2); do
   # Skip if project is empty or null
   if [ -z "$PROJECT" ]; then continue; fi
   
@@ -46,7 +46,7 @@ if [ -z "$CLUSTER_DOMAIN" ]; then
   API_URL=$(oc whoami --show-server 2>/dev/null)
   if [[ $API_URL =~ api\.([^:]+) ]]; then
     CLUSTER_DOMAIN="${BASH_REMATCH[1]}"
-    # Replace the 'api' prefix with 'apps'
+    # Replace the 'api' prefix with 'apps'va
     CLUSTER_DOMAIN="apps.${CLUSTER_DOMAIN#api.}"
     echo -e "${GREEN}Discovered domain: ${CLUSTER_DOMAIN} (from API URL)${NC}"
   fi
@@ -67,61 +67,68 @@ PROJECT_NAME="budibase"
 # Check if project exists
 if oc get project $PROJECT_NAME &>/dev/null; then
   echo -e "${YELLOW}Project '$PROJECT_NAME' already exists.${NC}"
-  read -p "Do you want to delete and recreate it? (y/n): " RECREATE
-  if [[ $RECREATE =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}Deleting project '$PROJECT_NAME'...${NC}"
-    oc delete project $PROJECT_NAME
-    echo -e "${YELLOW}Waiting for project deletion to complete...${NC}"
-    while oc get project $PROJECT_NAME &>/dev/null; do
-      echo -n "."
-      sleep 2
-    done
-    echo -e "\n${GREEN}Project deleted.${NC}"
-    
-    echo -e "${YELLOW}Creating new project '$PROJECT_NAME'...${NC}"
-    if ! oc new-project $PROJECT_NAME; then
-      echo -e "${RED}Failed to create project. You may not have permission.${NC}"
+  echo -e "${YELLOW}Deleting project '$PROJECT_NAME'...${NC}"
+  oc delete project $PROJECT_NAME
+  
+  echo -e "${YELLOW}Waiting for project deletion to complete...${NC}"
+  # More robust waiting for project deletion
+  TIMEOUT=120  # 2 minutes timeout
+  COUNTER=0
+  while oc get project $PROJECT_NAME &>/dev/null; do
+    echo -n "."
+    sleep 5
+    COUNTER=$((COUNTER+5))
+    if [ $COUNTER -ge $TIMEOUT ]; then
+      echo -e "\n${RED}Timeout waiting for project deletion.${NC}"
+      echo -e "${YELLOW}Please wait a bit longer and run the script again.${NC}"
+      exit 1
+    fi
+  done
+  echo -e "\n${GREEN}Project deleted.${NC}"
+  
+  # Important: Additional wait to ensure project is fully cleaned up in the API
+  echo -e "${YELLOW}Ensuring project is fully removed from the system...${NC}"
+  sleep 15
+fi
+
+# Try to create the project with retry logic
+echo -e "${YELLOW}Creating project '$PROJECT_NAME'...${NC}"
+RETRY_COUNT=0
+MAX_RETRIES=5
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  if oc new-project $PROJECT_NAME &>/dev/null; then
+    echo -e "${GREEN}Successfully created project '$PROJECT_NAME'.${NC}"
+    break
+  else
+    RETRY_COUNT=$((RETRY_COUNT+1))
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+      echo -e "${YELLOW}Failed to create project. Retrying in 10 seconds... (Attempt $RETRY_COUNT/$MAX_RETRIES)${NC}"
+      sleep 10
+    else
+      echo -e "${RED}Failed to create project after $MAX_RETRIES attempts.${NC}"
       read -p "Enter an existing project to use instead: " PROJECT_NAME
       if ! oc project $PROJECT_NAME &>/dev/null; then
         echo -e "${RED}Cannot access project '$PROJECT_NAME'. Exiting.${NC}"
         exit 1
       fi
     fi
-  else
-    echo -e "${GREEN}Using existing project '$PROJECT_NAME'.${NC}"
-    oc project $PROJECT_NAME &>/dev/null
   fi
-else
-  echo -e "${YELLOW}Project '$PROJECT_NAME' does not exist. Attempting to create...${NC}"
-  if ! oc new-project $PROJECT_NAME; then
-    echo -e "${RED}Failed to create project. You may not have permission.${NC}"
-    read -p "Enter an existing project to use instead: " PROJECT_NAME
-    if ! oc project $PROJECT_NAME &>/dev/null; then
-      echo -e "${RED}Cannot access project '$PROJECT_NAME'. Exiting.${NC}"
-      exit 1
-    fi
-  fi
-fi
+done
 
 echo -e "${GREEN}Using project: $PROJECT_NAME${NC}"
 
-# Check project quotas
-echo -e "${YELLOW}Checking project resource quotas...${NC}"
-PROJECT_QUOTA=$(oc get resourcequota -n $PROJECT_NAME -o jsonpath='{.items[*].spec.hard}' 2>/dev/null)
-if [ ! -z "$PROJECT_QUOTA" ]; then
-  echo -e "${YELLOW}Project has resource quotas: ${PROJECT_QUOTA}${NC}"
-  echo -e "${YELLOW}Adjusting Budibase resource limits to fit within quota...${NC}"
-fi
-
 # Storage class selection
-echo -e "${YELLOW}Checking available storage classes...${NC}"
+echo -e "${YELLOW}Detecting available storage classes...${NC}"
 STORAGE_CLASSES=$(oc get storageclass -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null)
+
+DEFAULT_SC="nfs"  # Default fallback
 
 if [ ! -z "$STORAGE_CLASSES" ]; then
   echo -e "${GREEN}Available storage classes:${NC}"
-  echo "$STORAGE_CLASSES" | nl -w2 -s') '
+  echo "$STORAGE_CLASSES"
   
-  # Attempt to identify common OpenShift storage classes
+  # Auto-select the storage class
   if echo "$STORAGE_CLASSES" | grep -q "nfs"; then
     DEFAULT_SC="nfs"
   elif echo "$STORAGE_CLASSES" | grep -q "thin"; then
@@ -132,28 +139,34 @@ if [ ! -z "$STORAGE_CLASSES" ]; then
     DEFAULT_SC=$(echo "$STORAGE_CLASSES" | head -n1)
   fi
   
-  echo -e "${YELLOW}Default storage class will be: ${DEFAULT_SC}${NC}"
-  read -p "Use this storage class? (y/n): " USE_DEFAULT_SC
-  
-  if [[ ! $USE_DEFAULT_SC =~ ^[Yy]$ ]]; then
-    read -p "Enter the number of the storage class to use: " SC_NUM
-    SELECTED_SC=$(echo "$STORAGE_CLASSES" | sed -n "${SC_NUM}p")
-    if [ ! -z "$SELECTED_SC" ]; then
-      DEFAULT_SC=$SELECTED_SC
-    fi
-  fi
-  
-  echo -e "${GREEN}Using storage class: ${DEFAULT_SC}${NC}"
+  echo -e "${GREEN}Auto-selected storage class: ${DEFAULT_SC}${NC}"
 else
   echo -e "${YELLOW}Could not retrieve storage classes. Using default (nfs).${NC}"
-  DEFAULT_SC="nfs"
 fi
 
-# Create OpenShift-compatible values.yaml with resource limits
+# Create the ConfigMap for nginx OpenShift compatibility first
+echo -e "${YELLOW}Creating nginx compatibility ConfigMap...${NC}"
+cat << EOF | oc apply -f - -n $PROJECT_NAME
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: budibase-proxy-openshift
+  namespace: $PROJECT_NAME
+data:
+  openshift.conf: |
+    # OpenShift-compatible nginx configuration
+    client_body_temp_path /tmp/nginx/client_body;
+    proxy_temp_path /tmp/nginx/proxy;
+    fastcgi_temp_path /tmp/nginx/fastcgi;
+    uwsgi_temp_path /tmp/nginx/uwsgi;
+    scgi_temp_path /tmp/nginx/scgi;
+EOF
+
+# Create OpenShift-compatible values.yaml with resource limits and nginx fixes
 echo -e "${YELLOW}Creating OpenShift-compatible values.yaml...${NC}"
 
 cat > values.yaml << EOF
-# OpenShift-compatible Budibase configuration
+# OpenShift-compatible Budibase configuration with nginx fixes
 
 global:
   openshift: true
@@ -196,7 +209,7 @@ worker:
       drop:
       - ALL
 
-# Proxy settings - Modified for OpenShift compatibility
+# Proxy settings - Critical OpenShift nginx fixes
 proxy:
   serviceAccount:
     create: true
@@ -217,10 +230,27 @@ proxy:
   containerSecurityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
+    runAsUser: null  # Let OpenShift assign the appropriate UID
+    fsGroup: null    # Let OpenShift assign the appropriate GID
     capabilities:
       drop:
       - ALL
     readOnlyRootFilesystem: false
+  # Special nginx configuration for OpenShift
+  extraVolumes:
+    - name: nginx-temp
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: nginx-temp
+      mountPath: /tmp/nginx
+  extraEnvVars:
+    - name: NGINX_TEMP_PATH
+      value: /tmp/nginx
+  extraConfigmapMounts:
+    - name: nginx-openshift-conf
+      mountPath: /etc/nginx/conf.d/openshift.conf
+      configMap: budibase-proxy-openshift
+      readOnly: true
 
 # CouchDB configuration - Modified for OpenShift compatibility
 couchdb:
@@ -276,7 +306,6 @@ redis:
     capabilities:
       drop:
       - ALL
-  # Ensure Redis slave pods have resource limits too
   slave:
     resources:
       limits:
@@ -305,16 +334,6 @@ minio:
       drop:
       - ALL
 
-# Ensure all init containers have resource limits
-initContainers:
-  resources:
-    limits:
-      cpu: 100m
-      memory: 128Mi
-    requests:
-      cpu: 50m
-      memory: 64Mi
-
 # Use Routes instead of Ingress for OpenShift
 ingress:
   enabled: false
@@ -326,16 +345,6 @@ route:
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
-
-# Global resource constraints for any containers not explicitly configured
-global:
-  defaultResources:
-    limits:
-      cpu: 100m
-      memory: 128Mi
-    requests:
-      cpu: 50m
-      memory: 64Mi
 EOF
 
 # Add the Budibase Helm repository
@@ -347,7 +356,6 @@ helm repo update
 echo -e "${YELLOW}Installing Budibase in project $PROJECT_NAME...${NC}"
 helm install budibase budibase/budibase -f values.yaml -n $PROJECT_NAME
 
-# Wait for pods to start initializing
 echo -e "${GREEN}Installation command completed. Checking pod status...${NC}"
 echo -e "${YELLOW}Waiting for pods to start (this may take a few minutes)...${NC}"
 sleep 15
@@ -356,26 +364,6 @@ sleep 15
 echo -e "${YELLOW}Initial pod status:${NC}"
 oc get pods -n $PROJECT_NAME
 
-# Check for pods in Pending state
-PENDING_PODS=$(oc get pods -n $PROJECT_NAME -o jsonpath='{.items[?(@.status.phase=="Pending")].metadata.name}')
-if [ ! -z "$PENDING_PODS" ]; then
-  echo -e "${RED}Some pods are in Pending state. Checking reasons...${NC}"
-  for POD in $PENDING_PODS; do
-    echo -e "${YELLOW}Details for pod $POD:${NC}"
-    oc describe pod $POD -n $PROJECT_NAME | grep -A5 "Status:" | grep -A5 "Message:"
-  done
-  
-  echo -e "${YELLOW}If pods are pending due to resource constraints, you may need to:${NC}"
-  echo -e "1. Reduce resource limits in values.yaml"
-  echo -e "2. Increase project quotas (requires admin)"
-  echo -e "3. Use a different namespace with higher quotas"
-fi
-
-# Check for events that might indicate quota issues
-echo -e "${YELLOW}Checking for quota-related events:${NC}"
-oc get events -n $PROJECT_NAME | grep -E 'quota|resources|limit|exceed'
-
 echo -e "${GREEN}Budibase installation process completed.${NC}"
 echo -e "${YELLOW}Access your Budibase instance at: ${NC}https://budibase.${CLUSTER_DOMAIN}"
-echo -e "${YELLOW}Note: It may take a few minutes for all pods to start and the route to become available.${NC}"
-echo -e "${YELLOW}If pods are not starting due to resource constraints, edit values.yaml and reinstall.${NC}"
+echo -e "${YELLOW}Note: It may take several minutes for all pods to start and the route to become available.${NC}"
