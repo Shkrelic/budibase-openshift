@@ -1,0 +1,52 @@
+# Minimal OpenShift compatibility configuration for Budibase
+# Only includes essential changes required for OpenShift
+
+global:
+  openshift: true
+
+# Critical security context settings for OpenShift
+proxy:
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+
+# CouchDB configuration - critical for OpenShift
+couchdb:
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+  containerSecurityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+      - ALL
+
+# Storage configuration
+couchdb:
+  persistence:
+    storageClass: "nfs"  # Options: nfs, thin, thin-csi
+redis:
+  master:
+    persistence:
+      storageClass: "nfs"  # Options: nfs, thin, thin-csi
+minio:
+  persistence:
+    storageClass: "nfs"  # Options: nfs, thin, thin-csi
+
+# Use Routes instead of Ingress for OpenShift
+ingress:
+  enabled: false
+
+route:
+  enabled: true
+  host: budibase.apps.your-cluster-domain.com
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
