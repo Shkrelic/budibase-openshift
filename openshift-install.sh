@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced Budibase deployment script for OpenShift with auto-discovery
+# Enhanced Budibase deployment script for OpenShift with resource quota support
 # Designed for users with limited privileges
 
 # Color codes for output
@@ -105,6 +105,50 @@ fi
 
 echo -e "${GREEN}Using project: $PROJECT_NAME${NC}"
 
+# Check project quotas
+echo -e "${YELLOW}Checking project resource quotas...${NC}"
+PROJECT_QUOTA=$(oc get resourcequota -n $PROJECT_NAME -o jsonpath='{.items[*].spec.hard}' 2>/dev/null)
+if [ ! -z "$PROJECT_QUOTA" ]; then
+  echo -e "${YELLOW}Project has resource quotas: ${PROJECT_QUOTA}${NC}"
+  echo -e "${YELLOW}Adjusting Budibase resource limits to fit within quota...${NC}"
+fi
+
+# Storage class selection
+echo -e "${YELLOW}Checking available storage classes...${NC}"
+STORAGE_CLASSES=$(oc get storageclass -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null)
+
+if [ ! -z "$STORAGE_CLASSES" ]; then
+  echo -e "${GREEN}Available storage classes:${NC}"
+  echo "$STORAGE_CLASSES" | nl -w2 -s') '
+  
+  # Attempt to identify common OpenShift storage classes
+  if echo "$STORAGE_CLASSES" | grep -q "nfs"; then
+    DEFAULT_SC="nfs"
+  elif echo "$STORAGE_CLASSES" | grep -q "thin"; then
+    DEFAULT_SC="thin"
+  elif echo "$STORAGE_CLASSES" | grep -q "thin-csi"; then
+    DEFAULT_SC="thin-csi"
+  else
+    DEFAULT_SC=$(echo "$STORAGE_CLASSES" | head -n1)
+  fi
+  
+  echo -e "${YELLOW}Default storage class will be: ${DEFAULT_SC}${NC}"
+  read -p "Use this storage class? (y/n): " USE_DEFAULT_SC
+  
+  if [[ ! $USE_DEFAULT_SC =~ ^[Yy]$ ]]; then
+    read -p "Enter the number of the storage class to use: " SC_NUM
+    SELECTED_SC=$(echo "$STORAGE_CLASSES" | sed -n "${SC_NUM}p")
+    if [ ! -z "$SELECTED_SC" ]; then
+      DEFAULT_SC=$SELECTED_SC
+    fi
+  fi
+  
+  echo -e "${GREEN}Using storage class: ${DEFAULT_SC}${NC}"
+else
+  echo -e "${YELLOW}Could not retrieve storage classes. Using default (nfs).${NC}"
+  DEFAULT_SC="nfs"
+fi
+
 # Create OpenShift-compatible values.yaml with resource limits
 echo -e "${YELLOW}Creating OpenShift-compatible values.yaml...${NC}"
 
@@ -181,7 +225,7 @@ proxy:
 # CouchDB configuration - Modified for OpenShift compatibility
 couchdb:
   persistence:
-    storageClass: "nfs"  # Options: nfs, thin, thin-csi
+    storageClass: "${DEFAULT_SC}"
     size: 5Gi
   resources:
     limits:
@@ -217,7 +261,7 @@ couchdb:
 redis:
   master:
     persistence:
-      storageClass: "nfs"  # Options: nfs, thin, thin-csi
+      storageClass: "${DEFAULT_SC}"
       size: 1Gi
     resources:
       limits:
@@ -232,11 +276,20 @@ redis:
     capabilities:
       drop:
       - ALL
+  # Ensure Redis slave pods have resource limits too
+  slave:
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
 
 # Minio configuration
 minio:
   persistence:
-    storageClass: "nfs"  # Options: nfs, thin, thin-csi
+    storageClass: "${DEFAULT_SC}"
     size: 5Gi
   resources:
     limits:
@@ -252,6 +305,16 @@ minio:
       drop:
       - ALL
 
+# Ensure all init containers have resource limits
+initContainers:
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
 # Use Routes instead of Ingress for OpenShift
 ingress:
   enabled: false
@@ -263,45 +326,17 @@ route:
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
+
+# Global resource constraints for any containers not explicitly configured
+global:
+  defaultResources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
 EOF
-
-# Storage class selection
-echo -e "${YELLOW}Checking available storage classes...${NC}"
-STORAGE_CLASSES=$(oc get storageclass -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null)
-
-if [ ! -z "$STORAGE_CLASSES" ]; then
-  echo -e "${GREEN}Available storage classes:${NC}"
-  echo "$STORAGE_CLASSES" | nl -w2 -s') '
-  
-  # Attempt to identify common OpenShift storage classes
-  if echo "$STORAGE_CLASSES" | grep -q "nfs"; then
-    DEFAULT_SC="nfs"
-  elif echo "$STORAGE_CLASSES" | grep -q "thin"; then
-    DEFAULT_SC="thin"
-  elif echo "$STORAGE_CLASSES" | grep -q "thin-csi"; then
-    DEFAULT_SC="thin-csi"
-  else
-    DEFAULT_SC=$(echo "$STORAGE_CLASSES" | head -n1)
-  fi
-  
-  echo -e "${YELLOW}Default storage class will be: ${DEFAULT_SC}${NC}"
-  read -p "Use this storage class? (y/n): " USE_DEFAULT_SC
-  
-  if [[ ! $USE_DEFAULT_SC =~ ^[Yy]$ ]]; then
-    read -p "Enter the number of the storage class to use: " SC_NUM
-    SELECTED_SC=$(echo "$STORAGE_CLASSES" | sed -n "${SC_NUM}p")
-    if [ ! -z "$SELECTED_SC" ]; then
-      DEFAULT_SC=$SELECTED_SC
-    fi
-  fi
-  
-  echo -e "${GREEN}Using storage class: ${DEFAULT_SC}${NC}"
-  
-  # Update the values.yaml file with the selected storage class
-  sed -i "s/storageClass: \"nfs\"/storageClass: \"${DEFAULT_SC}\"/g" values.yaml
-else
-  echo -e "${YELLOW}Could not retrieve storage classes. Using default (nfs).${NC}"
-fi
 
 # Add the Budibase Helm repository
 echo -e "${YELLOW}Adding Budibase Helm repository...${NC}"
@@ -312,13 +347,35 @@ helm repo update
 echo -e "${YELLOW}Installing Budibase in project $PROJECT_NAME...${NC}"
 helm install budibase budibase/budibase -f values.yaml -n $PROJECT_NAME
 
+# Wait for pods to start initializing
 echo -e "${GREEN}Installation command completed. Checking pod status...${NC}"
 echo -e "${YELLOW}Waiting for pods to start (this may take a few minutes)...${NC}"
-sleep 10
+sleep 15
 
 # Check pod status
+echo -e "${YELLOW}Initial pod status:${NC}"
 oc get pods -n $PROJECT_NAME
+
+# Check for pods in Pending state
+PENDING_PODS=$(oc get pods -n $PROJECT_NAME -o jsonpath='{.items[?(@.status.phase=="Pending")].metadata.name}')
+if [ ! -z "$PENDING_PODS" ]; then
+  echo -e "${RED}Some pods are in Pending state. Checking reasons...${NC}"
+  for POD in $PENDING_PODS; do
+    echo -e "${YELLOW}Details for pod $POD:${NC}"
+    oc describe pod $POD -n $PROJECT_NAME | grep -A5 "Status:" | grep -A5 "Message:"
+  done
+  
+  echo -e "${YELLOW}If pods are pending due to resource constraints, you may need to:${NC}"
+  echo -e "1. Reduce resource limits in values.yaml"
+  echo -e "2. Increase project quotas (requires admin)"
+  echo -e "3. Use a different namespace with higher quotas"
+fi
+
+# Check for events that might indicate quota issues
+echo -e "${YELLOW}Checking for quota-related events:${NC}"
+oc get events -n $PROJECT_NAME | grep -E 'quota|resources|limit|exceed'
 
 echo -e "${GREEN}Budibase installation process completed.${NC}"
 echo -e "${YELLOW}Access your Budibase instance at: ${NC}https://budibase.${CLUSTER_DOMAIN}"
 echo -e "${YELLOW}Note: It may take a few minutes for all pods to start and the route to become available.${NC}"
+echo -e "${YELLOW}If pods are not starting due to resource constraints, edit values.yaml and reinstall.${NC}"
