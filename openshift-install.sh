@@ -1,6 +1,6 @@
 #!/bin/bash
 # Comprehensive Budibase deployment script for OpenShift
-# Fully automated with proper nginx permissions and resource limits
+# With nginx permission fix and resource limits
 
 # Color codes for output
 GREEN='\033[0;32m'
@@ -46,7 +46,7 @@ if [ -z "$CLUSTER_DOMAIN" ]; then
   API_URL=$(oc whoami --show-server 2>/dev/null)
   if [[ $API_URL =~ api\.([^:]+) ]]; then
     CLUSTER_DOMAIN="${BASH_REMATCH[1]}"
-    # Replace the 'api' prefix with 'apps'va
+    # Replace the 'api' prefix with 'apps'
     CLUSTER_DOMAIN="apps.${CLUSTER_DOMAIN#api.}"
     echo -e "${GREEN}Discovered domain: ${CLUSTER_DOMAIN} (from API URL)${NC}"
   fi
@@ -144,38 +144,66 @@ else
   echo -e "${YELLOW}Could not retrieve storage classes. Using default (nfs).${NC}"
 fi
 
-# Create the ConfigMap for nginx OpenShift compatibility first
-echo -e "${YELLOW}Creating nginx compatibility ConfigMap...${NC}"
+# Create nginx-init ConfigMap for initialization script
+echo -e "${YELLOW}Creating nginx initialization ConfigMap...${NC}"
 cat << EOF | oc apply -f - -n $PROJECT_NAME
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: budibase-proxy-openshift
+  name: nginx-init-script
   namespace: $PROJECT_NAME
 data:
-  openshift.conf: |
-    # OpenShift-compatible nginx configuration
-    client_body_temp_path /tmp/nginx/client_body;
-    proxy_temp_path /tmp/nginx/proxy;
-    fastcgi_temp_path /tmp/nginx/fastcgi;
-    uwsgi_temp_path /tmp/nginx/uwsgi;
-    scgi_temp_path /tmp/nginx/scgi;
+  init.sh: |
+    #!/bin/sh
+    # Script to create and set permissions for nginx temp directories
+    mkdir -p /tmp/nginx/client_temp
+    mkdir -p /tmp/nginx/proxy_temp
+    mkdir -p /tmp/nginx/fastcgi_temp
+    mkdir -p /tmp/nginx/uwsgi_temp
+    mkdir -p /tmp/nginx/scgi_temp
+    chmod 777 /tmp/nginx /tmp/nginx/*
+    # Symlink the default nginx cache directories to our writable ones
+    mkdir -p /var/cache/nginx
+    ln -sf /tmp/nginx/client_temp /var/cache/nginx/client_temp
+    ln -sf /tmp/nginx/proxy_temp /var/cache/nginx/proxy_temp
+    ln -sf /tmp/nginx/fastcgi_temp /var/cache/nginx/fastcgi_temp
+    ln -sf /tmp/nginx/uwsgi_temp /var/cache/nginx/uwsgi_temp
+    ln -sf /tmp/nginx/scgi_temp /var/cache/nginx/scgi_temp
+    # Set permissions again to be safe
+    chmod 777 /var/cache/nginx /var/cache/nginx/*
+    echo "Nginx temp directories prepared"
 EOF
 
-# Create OpenShift-compatible values.yaml with resource limits and nginx fixes
+# Create LimitRange to ensure all pods have default limits
+echo -e "${YELLOW}Creating LimitRange for default resource limits...${NC}"
+cat << EOF | oc apply -f - -n $PROJECT_NAME
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: budibase-limits
+  namespace: $PROJECT_NAME
+spec:
+  limits:
+  - default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 256Mi
+    type: Container
+EOF
+
+# Create OpenShift-compatible values.yaml with nginx fix
 echo -e "${YELLOW}Creating OpenShift-compatible values.yaml...${NC}"
 
 cat > values.yaml << EOF
-# OpenShift-compatible Budibase configuration with nginx fixes
+# OpenShift-compatible Budibase configuration
 
 global:
   openshift: true
 
-# App service configuration
+# App service
 app:
-  image:
-    repository: budibase/budibase
-    pullPolicy: IfNotPresent
   resources:
     limits:
       cpu: 500m
@@ -186,14 +214,8 @@ app:
   securityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
-  serviceAccount:
-    create: true
-    name: "budibase-budibase"
 
-# Worker service configuration
+# Worker service
 worker:
   resources:
     limits:
@@ -205,15 +227,9 @@ worker:
   securityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
 
-# Proxy settings - Critical OpenShift nginx fixes
+# Proxy settings with complete nginx fix
 proxy:
-  serviceAccount:
-    create: true
-    name: "budibase-budibase"
   resources:
     limits:
       cpu: 200m
@@ -224,35 +240,35 @@ proxy:
   securityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
   containerSecurityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    runAsUser: null  # Let OpenShift assign the appropriate UID
-    fsGroup: null    # Let OpenShift assign the appropriate GID
-    capabilities:
-      drop:
-      - ALL
-    readOnlyRootFilesystem: false
-  # Special nginx configuration for OpenShift
+    runAsUser: null
+    fsGroup: null
   extraVolumes:
     - name: nginx-temp
       emptyDir: {}
+    - name: nginx-init
+      configMap:
+        name: nginx-init-script
+        defaultMode: 0777
   extraVolumeMounts:
     - name: nginx-temp
       mountPath: /tmp/nginx
-  extraEnvVars:
-    - name: NGINX_TEMP_PATH
-      value: /tmp/nginx
-  extraConfigmapMounts:
-    - name: nginx-openshift-conf
-      mountPath: /etc/nginx/conf.d/openshift.conf
-      configMap: budibase-proxy-openshift
-      readOnly: true
+  initContainers:
+    - name: nginx-init
+      image: busybox
+      command: ["/bin/sh", "/nginx-init/init.sh"]
+      securityContext:
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+      volumeMounts:
+        - name: nginx-init
+          mountPath: /nginx-init
+        - name: nginx-temp
+          mountPath: /tmp/nginx
 
-# CouchDB configuration - Modified for OpenShift compatibility
+# CouchDB configuration
 couchdb:
   persistence:
     storageClass: "${DEFAULT_SC}"
@@ -264,28 +280,12 @@ couchdb:
     requests:
       cpu: 100m
       memory: 512Mi
-  serviceAccount:
-    create: true
-    name: "budibase-couchdb"
   securityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
   containerSecurityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
-  initContainers:
-    securityContext:
-      runAsNonRoot: true
-      allowPrivilegeEscalation: false
-      capabilities:
-        drop:
-        - ALL
 
 # Redis configuration
 redis:
@@ -300,12 +300,6 @@ redis:
       requests:
         cpu: 50m
         memory: 128Mi
-  securityContext:
-    runAsNonRoot: true
-    allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
   slave:
     resources:
       limits:
@@ -314,6 +308,9 @@ redis:
       requests:
         cpu: 50m
         memory: 64Mi
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
 
 # Minio configuration
 minio:
@@ -330,15 +327,11 @@ minio:
   securityContext:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
 
-# Use Routes instead of Ingress for OpenShift
+# Routes instead of Ingress
 ingress:
   enabled: false
 
-# Enable OpenShift Routes
 route:
   enabled: true
   host: budibase.${CLUSTER_DOMAIN}
@@ -356,13 +349,77 @@ helm repo update
 echo -e "${YELLOW}Installing Budibase in project $PROJECT_NAME...${NC}"
 helm install budibase budibase/budibase -f values.yaml -n $PROJECT_NAME
 
-echo -e "${GREEN}Installation command completed. Checking pod status...${NC}"
-echo -e "${YELLOW}Waiting for pods to start (this may take a few minutes)...${NC}"
+echo -e "${GREEN}Installation command completed. Waiting for pods to start...${NC}"
+echo -e "${YELLOW}This may take a few minutes...${NC}"
 sleep 15
 
 # Check pod status
 echo -e "${YELLOW}Initial pod status:${NC}"
 oc get pods -n $PROJECT_NAME
+
+# Direct patch for proxy deployment in case the initContainer approach doesn't work
+echo -e "${YELLOW}Applying direct fix for proxy deployment...${NC}"
+# Wait for proxy deployment to be created
+PROXY_DEPLOY=""
+TIMEOUT=60
+COUNTER=0
+while [ -z "$PROXY_DEPLOY" ] && [ $COUNTER -lt $TIMEOUT ]; do
+  PROXY_DEPLOY=$(oc get deployment -n $PROJECT_NAME | grep proxy | awk '{print $1}')
+  if [ -z "$PROXY_DEPLOY" ]; then
+    echo -n "."
+    sleep 5
+    COUNTER=$((COUNTER+5))
+  fi
+done
+echo ""
+
+if [ ! -z "$PROXY_DEPLOY" ]; then
+  # Create patch file
+  cat > proxy-patch.yaml << EOF
+spec:
+  template:
+    spec:
+      volumes:
+      - name: nginx-temp
+        emptyDir: {}
+      - name: nginx-init
+        configMap:
+          name: nginx-init-script
+          defaultMode: 511
+      initContainers:
+      - name: nginx-init
+        image: busybox
+        command: 
+        - /bin/sh
+        - /nginx-init/init.sh
+        securityContext:
+          runAsNonRoot: false
+          privileged: false
+        volumeMounts:
+        - name: nginx-init
+          mountPath: /nginx-init
+        - name: nginx-temp
+          mountPath: /tmp/nginx
+      containers:
+      - name: proxy
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: nginx-temp
+          mountPath: /tmp/nginx
+        securityContext:
+          privileged: false
+EOF
+
+  # Apply the patch
+  oc patch deployment $PROXY_DEPLOY --patch "$(cat proxy-patch.yaml)" -n $PROJECT_NAME
+  echo -e "${GREEN}Proxy deployment patched. It may take a moment to restart.${NC}"
+fi
 
 echo -e "${GREEN}Budibase installation process completed.${NC}"
 echo -e "${YELLOW}Access your Budibase instance at: ${NC}https://budibase.${CLUSTER_DOMAIN}"
