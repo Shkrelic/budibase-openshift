@@ -1,5 +1,5 @@
 #!/bin/bash
-# Budibase OpenShift Installer
+# Budibase OpenShift Installer with fixed image configuration
 # Using nginxinc/nginx-unprivileged with resource limits for all components
 
 # Color codes for output
@@ -67,8 +67,8 @@ fi
 echo -e "${GREEN}Using cluster domain: ${CLUSTER_DOMAIN}${NC}"
 
 # Project management
-echo -e "${YELLOW}Setting up project for Budibase...${NC}"
 PROJECT_NAME="budibase"
+echo -e "${YELLOW}Setting up project for Budibase...${NC}"
 
 # Check if project exists
 if oc get project $PROJECT_NAME &>/dev/null; then
@@ -142,14 +142,49 @@ else
   read -p "Enter storage class name to use: " DEFAULT_SC
 fi
 
-# Create OpenShift-compatible values.yaml with resource limits for all components
-echo -e "${YELLOW}Creating OpenShift-compatible values.yaml with resource limits...${NC}"
+# Create OpenShift-compatible values.yaml with correct image configuration
+echo -e "${YELLOW}Creating OpenShift-compatible values.yaml with correct proxy image...${NC}"
 
 cat > values.yaml << EOF
 # OpenShift-compatible Budibase configuration with resource limits for all components
 
-# App service configuration
+# Global container image override for proxy
+# This is the key part to ensure our image is used
+globals:
+  # Set version to ensure our image is used
+  appVersion: "custom-openshift"
+
+# Image override - multiple paths to try to ensure it takes effect
+proxy:
+  image:
+    repository: nginxinc/nginx-unprivileged
+    tag: latest
+    pullPolicy: Always
+
+# Also try services.proxy path
 services:
+  proxy:
+    image:
+      repository: nginxinc/nginx-unprivileged
+      tag: latest
+      pullPolicy: Always
+    port: 8080
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 128Mi
+    # Add volume for temp files
+    extraVolumes:
+      - name: tmp-volume
+        emptyDir: {}
+    extraVolumeMounts:
+      - name: tmp-volume
+        mountPath: /tmp
+  
+  # Apps service configuration
   apps:
     resources:
       limits:
@@ -179,27 +214,6 @@ services:
         cpu: 50m
         memory: 128Mi
   
-  # Proxy service configuration with nginx-unprivileged
-  proxy:
-    image:
-      repository: nginxinc/nginx-unprivileged
-      tag: latest
-    port: 8080
-    resources:
-      limits:
-        cpu: 200m
-        memory: 256Mi
-      requests:
-        cpu: 50m
-        memory: 128Mi
-    # Add volume for temp files
-    extraVolumes:
-      - name: tmp-volume
-        emptyDir: {}
-    extraVolumeMounts:
-      - name: tmp-volume
-        mountPath: /tmp
-  
   # Redis configuration
   redis:
     resources:
@@ -224,9 +238,8 @@ services:
     storage: 5Gi
     storageClass: "${DEFAULT_SC}"
 
-# Service configuration
+# Service configuration - make sure proxy service is correctly configured
 service:
-  # Update service port to match container port
   port: 8080
 
 # CouchDB configuration
@@ -270,12 +283,40 @@ helm repo update
 echo -e "${YELLOW}Installing Budibase in project $PROJECT_NAME...${NC}"
 helm install budibase budibase/budibase -f values.yaml -n $PROJECT_NAME
 
-echo -e "${GREEN}Installation started. Waiting for pods to be created...${NC}"
+echo -e "${GREEN}Installation started. Checking for pods...${NC}"
 sleep 20
 
 # Check pod status
 echo -e "${YELLOW}Initial pod status:${NC}"
 oc get pods -n $PROJECT_NAME
+
+# Check what image the proxy pod is using
+echo -e "${YELLOW}Checking proxy pod image:${NC}"
+PROXY_POD=$(oc get pods -n $PROJECT_NAME -l app=proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ ! -z "$PROXY_POD" ]; then
+  PROXY_IMAGE=$(oc get pod $PROXY_POD -n $PROJECT_NAME -o jsonpath='{.spec.containers[0].image}')
+  echo -e "${GREEN}Proxy pod $PROXY_POD is using image: $PROXY_IMAGE${NC}"
+else
+  echo -e "${YELLOW}No proxy pod found yet. It may still be creating.${NC}"
+fi
+
+# If we're still not using the right image, try direct patching
+if [[ "$PROXY_IMAGE" != *"nginxinc/nginx-unprivileged"* && ! -z "$PROXY_POD" ]]; then
+  echo -e "${YELLOW}Image override in values.yaml didn't work. Trying direct deployment patch...${NC}"
+  
+  # Patch the deployment directly
+  oc patch deployment proxy -n $PROJECT_NAME -p '{"spec":{"template":{"spec":{"containers":[{"name":"proxy","image":"nginxinc/nginx-unprivileged:latest"}]}}}}' || true
+  
+  echo -e "${YELLOW}Deployment patched. Waiting for new pod...${NC}"
+  sleep 20
+  
+  # Check again
+  PROXY_POD=$(oc get pods -n $PROJECT_NAME -l app=proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ ! -z "$PROXY_POD" ]; then
+    PROXY_IMAGE=$(oc get pod $PROXY_POD -n $PROJECT_NAME -o jsonpath='{.spec.containers[0].image}')
+    echo -e "${GREEN}Proxy pod $PROXY_POD is now using image: $PROXY_IMAGE${NC}"
+  fi
+fi
 
 echo -e "${GREEN}Budibase installation process completed.${NC}"
 echo -e "${YELLOW}Access your Budibase instance at: ${NC}https://budibase.${CLUSTER_DOMAIN}"
