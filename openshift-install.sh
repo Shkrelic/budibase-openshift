@@ -13,13 +13,40 @@ echo -e "${YELLOW}Starting Budibase OpenShift deployment...${NC}"
 TEMP_DIR=$(mktemp -d)
 cd $TEMP_DIR
 
-# Detect OpenShift cluster domain for route configuration
+# Try alternative approaches to detect the cluster domain
 echo -e "${YELLOW}Detecting OpenShift cluster domain...${NC}"
-CLUSTER_DOMAIN=$(oc get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null | sed 's/^console//' | sed 's/^.//')
 
+# Try method 1: Check if we can get a route from any accessible project
+CLUSTER_DOMAIN=""
+PROJECTS=$(oc get projects -o name 2>/dev/null | cut -d'/' -f2)
+for PROJECT in $PROJECTS; do
+  ROUTE=$(oc get routes -n $PROJECT -o jsonpath='{.items[0].spec.host}' 2>/dev/null)
+  if [ ! -z "$ROUTE" ]; then
+    # Extract domain by removing everything up to the first dot
+    CLUSTER_DOMAIN=$(echo $ROUTE | sed 's/[^.]*\(\..*\)/\1/')
+    echo -e "${GREEN}Detected cluster domain from route in project $PROJECT: ${CLUSTER_DOMAIN}${NC}"
+    break
+  fi
+done
+
+# Try method 2: Extract from API server URL if method 1 failed
+if [ -z "$CLUSTER_DOMAIN" ]; then
+  API_URL=$(oc whoami --show-server 2>/dev/null)
+  if [[ $API_URL =~ api\.([^:]+) ]]; then
+    CLUSTER_DOMAIN=".apps.${BASH_REMATCH[1]}"
+    echo -e "${GREEN}Detected cluster domain from API URL: ${CLUSTER_DOMAIN}${NC}"
+  fi
+fi
+
+# Fallback to manual input if automatic detection fails
 if [ -z "$CLUSTER_DOMAIN" ]; then
   echo -e "${RED}Could not detect cluster domain automatically.${NC}"
   read -p "Please enter your cluster domain (e.g., .apps.openshift.example.com): " CLUSTER_DOMAIN
+  
+  # Ensure domain starts with a dot
+  if [[ $CLUSTER_DOMAIN != .* ]]; then
+    CLUSTER_DOMAIN=".$CLUSTER_DOMAIN"
+  fi
 fi
 
 echo -e "${GREEN}Using cluster domain: ${CLUSTER_DOMAIN}${NC}"
