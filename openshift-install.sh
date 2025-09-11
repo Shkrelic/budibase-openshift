@@ -126,12 +126,11 @@ echo -e "${GREEN}Using StorageClass: ${STORAGE_CLASS}${NC}"
 
 # Create ConfigMap with /docker-entrypoint.d patch (runs after envsubst)
 echo -e "${YELLOW}Creating nginx unprivileged patch ConfigMap...${NC}"
-cat <<'EOF' | oc apply -f -
+cat <<'EOF' | oc apply -n "${NAMESPACE}" -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: budibase-nginx-unpriv
-  namespace: budibase
 data:
   90-openshift-unprivileged.sh: |
     #!/bin/sh
@@ -167,12 +166,12 @@ data:
       # inject temp paths into http block once
       if ! grep -q 'client_body_temp_path /tmp/client_temp;' /etc/nginx/nginx.conf; then
         sed -i '/http {/a \
-  # Temp paths for OpenShift arbitrary UID\
-  client_body_temp_path /tmp/client_temp;\
-  proxy_temp_path       /tmp/proxy_temp;\
-  fastcgi_temp_path     /tmp/fastcgi_temp;\
-  uwsgi_temp_path       /tmp/uwsgi_temp;\
-  scgi_temp_path        /tmp/scgi_temp;' /etc/nginx/nginx.conf || true
+        # Temp paths for OpenShift arbitrary UID\
+        client_body_temp_path /tmp/client_temp;\
+        proxy_temp_path       /tmp/proxy_temp;\
+        fastcgi_temp_path     /tmp/fastcgi_temp;\
+        uwsgi_temp_path       /tmp/uwsgi_temp;\
+        scgi_temp_path        /tmp/scgi_temp;' /etc/nginx/nginx.conf || true
       fi
 
       echo "[openshift] nginx.conf patched for non-root operation."
