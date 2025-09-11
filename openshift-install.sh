@@ -3,6 +3,7 @@
 # - Keeps Budibase Helm chart vanilla
 # - Avoids writing to /etc/nginx by redirecting envsubst output to /tmp
 # - Makes nginx runtime dirs writable via volumes + fsGroup
+# - Patches proxy deployment args so nginx uses /tmp/nginx.conf (port 10000)
 # - No cluster-admin required
 
 set -Eeuo pipefail
@@ -82,9 +83,9 @@ if [[ -z "${STORAGE_CLASS}" ]]; then
 fi
 echo -e "${GREEN}Using StorageClass: ${STORAGE_CLASS}${NC}"
 
-# Find a valid fsGroup from the namespace supplemental group range
+# Detect fsGroup from namespace range (OpenShift UIDs/GIDs guidance)
 detect_fsGroup() {
-  local rng sup uidrng base
+  local rng sup uidrng
   sup="$(oc get ns "${NAMESPACE}" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' 2>/dev/null || true)"
   uidrng="$(oc get ns "${NAMESPACE}" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null || true)"
   rng="${sup:-$uidrng}"
@@ -101,7 +102,7 @@ else
   echo -e "${GREEN}Using fsGroup: ${FSGROUP}${NC}"
 fi
 
-# ConfigMap: set envsubst output dir; drop IPv6 listens from /tmp/nginx.conf if needed
+# ConfigMap hooks
 echo -e "${YELLOW}Creating nginx OpenShift hook ConfigMap...${NC}"
 cat <<'EOF' | oc apply -n "${NAMESPACE}" -f -
 apiVersion: v1
@@ -127,7 +128,7 @@ data:
 EOF
 echo -e "${GREEN}ConfigMap created/updated.${NC}"
 
-# Generate Helm values override
+# Generate Helm values override (volumes + mounts only; NO args here)
 VALUES_FILE="$(mktemp -t bb-values-XXXXXXXX.yaml)"
 echo -e "${YELLOW}Generating Helm values override: ${VALUES_FILE}${NC}"
 
@@ -168,12 +169,6 @@ services:
         mountPath: /var/log/nginx
       - name: run-volume
         mountPath: /var/run
-    args:
-      - nginx
-      - -c
-      - /tmp/nginx.conf
-      - -g
-      - daemon off;
 EOF
 
 # Optional resolver override (quoted)
@@ -228,6 +223,16 @@ JSON
 )" >/dev/null || echo -e "${YELLOW}Warning: fsGroup patch failed (SCC may inject it automatically or deny).${NC}"
 fi
 
+# CRITICAL: ensure nginx uses /tmp/nginx.conf (port 10000) instead of default (port 80)
+echo -e "${YELLOW}Patching proxy container args to use /tmp/nginx.conf...${NC}"
+PATCH_JSON='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
+if ! oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null 2>&1; then
+  # fallback if args field not present yet
+  PATCH_JSON='[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
+  oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null
+fi
+echo -e "${GREEN}Patched container args.${NC}"
+
 # OpenShift Route
 ROUTE_HOST="budibase.${APPS_DOMAIN}"
 echo -e "${YELLOW}Creating/Updating OpenShift Route: https://${ROUTE_HOST}${NC}"
@@ -266,7 +271,8 @@ echo -e "${YELLOW}Note: It can take a few minutes for all pods to fully initiali
 
 echo -e "${BLUE}Troubleshooting Tips:${NC}"
 echo -e "  - Proxy logs:   oc logs deploy/proxy-service -n ${NAMESPACE}"
-echo -e "  - Inspect conf: oc rsh deploy/proxy-service -- cat /tmp/nginx.conf | sed -n '1,120p'"
+echo -e "  - Verify args:  oc get deploy/proxy-service -n ${NAMESPACE} -o jsonpath='{.spec.template.spec.containers[0].args}'"
+echo -e "  - Inspect conf: oc rsh deploy/proxy-service -- grep -E 'listen|pid|access_log' /tmp/nginx.conf | sed -n '1,120p'"
 echo -e "  - Pods:         oc get pods -n ${NAMESPACE}"
 echo -e "  - Events:       oc get events -n ${NAMESPACE} --sort-by=.lastTimestamp | tail -n 50"
 echo -e "  - Route:        oc get route ${RELEASE_NAME} -n ${NAMESPACE} -o wide"
