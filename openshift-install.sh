@@ -4,7 +4,7 @@
 # - Patches nginx at runtime via /docker-entrypoint.d
 # - No image changes; no cluster-admin required
 
-set -euo pipefail
+set -Eeuo pipefail
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -126,11 +126,12 @@ echo -e "${GREEN}Using StorageClass: ${STORAGE_CLASS}${NC}"
 
 # Create ConfigMap with /docker-entrypoint.d patch (runs after envsubst)
 echo -e "${YELLOW}Creating nginx unprivileged patch ConfigMap...${NC}"
-cat <<'EOF' | oc apply -n "${NAMESPACE}" -f -
+cat <<'EOF' | oc apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: budibase-nginx-unpriv
+  namespace: budibase
 data:
   90-openshift-unprivileged.sh: |
     #!/bin/sh
@@ -146,19 +147,19 @@ data:
     if [ -f /etc/nginx/nginx.conf ]; then
       cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.orig || true
 
-      # error log to /tmp
-      if grep -qE '^\s*error_log\s+' /etc/nginx/nginx.conf; then
-        sed -i 's|^\\s*error_log\\s\\+.*;|error_log               /tmp/error.log debug;|' /etc/nginx/nginx.conf || true
+      # error log to /tmp (portable sed)
+      if grep -qE '^[[:space:]]*error_log[[:space:]]+' /etc/nginx/nginx.conf; then
+        sed -i -E 's|^[[:space:]]*error_log[[:space:]]+.*;|error_log               /tmp/error.log debug;|' /etc/nginx/nginx.conf || true
       else
         sed -i '1i error_log               /tmp/error.log debug;' /etc/nginx/nginx.conf || true
       fi
 
       # access log to /tmp
-      sed -i 's|access_log /var/log/nginx/access.log main;|access_log /tmp/access.log main;|' /etc/nginx/nginx.conf || true
+      sed -i -E 's|access_log[[:space:]]+/var/log/nginx/access\.log[[:space:]]+main;|access_log /tmp/access.log main;|' /etc/nginx/nginx.conf || true
 
-      # pid to /tmp
-      if grep -qE '^\s*pid\s+' /etc/nginx/nginx.conf; then
-        sed -i 's|^\\s*pid\\s\\+.*;|pid                     /tmp/nginx.pid;|' /etc/nginx/nginx.conf || true
+      # pid to /tmp (portable sed)
+      if grep -qE '^[[:space:]]*pid[[:space:]]+' /etc/nginx/nginx.conf; then
+        sed -i -E 's|^[[:space:]]*pid[[:space:]]+.*;|pid                     /tmp/nginx.pid;|' /etc/nginx/nginx.conf || true
       else
         sed -i '1i pid                     /tmp/nginx.pid;' /etc/nginx/nginx.conf || true
       fi
@@ -187,6 +188,7 @@ echo -e "${GREEN}ConfigMap created/updated.${NC}"
 VALUES_FILE="$(mktemp -t bb-values-XXXXXXXX.yaml)"
 echo -e "${YELLOW}Generating Helm values override at ${VALUES_FILE}...${NC}"
 
+# First part
 cat > "${VALUES_FILE}" <<EOF
 ingress:
   enabled: false
@@ -206,7 +208,15 @@ services:
         subPath: 90-openshift-unprivileged.sh
       - name: tmp-volume
         mountPath: /tmp
-$( [[ -n "${RESOLVER_IP}" ]] && echo "    resolver: ${RESOLVER_IP}" )
+EOF
+
+# Safe optional resolver (quoted)
+if [[ -n "${RESOLVER_IP}" ]]; then
+  printf "    resolver: \"%s\"\n" "${RESOLVER_IP}" >> "${VALUES_FILE}"
+fi
+
+# Rest
+cat >> "${VALUES_FILE}" <<EOF
 
   objectStore:
     storageClass: "${STORAGE_CLASS}"
