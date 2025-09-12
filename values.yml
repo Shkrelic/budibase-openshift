@@ -1,34 +1,31 @@
-# Disable Ingress; use an OpenShift Route instead (instructions below)
+# Disable Helm Ingress; expose with an OpenShift Route after install
 ingress:
   enabled: false
 
 services:
   proxy:
-    # Mount the unprivileged hooks and wrapper
+    # Mount entrypoint hooks + nginx wrapper
     extraVolumes:
       - name: nginx-unpriv
         configMap:
           name: budibase-nginx-unpriv
           defaultMode: 0755
     extraVolumeMounts:
-      # Pre-envsubst: send output to /tmp and set resolver
       - name: nginx-unpriv
         mountPath: /docker-entrypoint.d/15-openshift.envsh
         subPath: 15-openshift.envsh
-      # Post-envsubst: remove IPv6 listen when IPv6 is unavailable
       - name: nginx-unpriv
         mountPath: /docker-entrypoint.d/80-listen-on-ipv6-by-default.sh
         subPath: 80-listen-on-ipv6-by-default.sh
-      # Post-envsubst: patch pid + temp paths to /tmp
       - name: nginx-unpriv
         mountPath: /docker-entrypoint.d/90-openshift-unprivileged.sh
         subPath: 90-openshift-unprivileged.sh
-      # Force nginx to use /tmp/nginx.conf (wrapper masks the real binary in PATH)
+      # Wrapper takes precedence in PATH and forces -c /tmp/nginx.conf
       - name: nginx-unpriv
         mountPath: /usr/local/bin/nginx
         subPath: nginx-wrapper
 
-    # Resource requests/limits (required by OpenShift)
+    # Resource requests/limits (OpenShift requires these)
     resources:
       requests:
         cpu: "100m"
@@ -55,18 +52,8 @@ services:
         cpu: "1000m"
         memory: "1Gi"
 
-  redis:
-    # If you’re using the bundled Redis
-    resources:
-      requests:
-        cpu: "50m"
-        memory: "128Mi"
-      limits:
-        cpu: "300m"
-        memory: "512Mi"
-
-  objectStore:
-    # If you’re using the bundled MinIO
+  automationWorkers:
+    # enabled defaults to true in chart; keep same sizing as worker by default
     resources:
       requests:
         cpu: "200m"
@@ -75,14 +62,43 @@ services:
         cpu: "1000m"
         memory: "1Gi"
 
-# CouchDB subchart resources (applied to the Apache CouchDB chart)
-# Adjust if your cluster has different quotas. If the subchart rejects these keys,
-# consult the subchart docs and move these under the correct field names.
+  redis:
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "300m"
+        memory: "512Mi"
+
+  objectStore:  # MinIO
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+# CouchDB subchart resources (uses Apache CouchDB chart keys).
+# If your OpenShift policy enforces resources on all pods, set them here per the subchart docs:
+# https://github.com/apache/couchdb-helm/tree/couchdb-4.3.0/couchdb
+# Example (commonly supported in that chart):
 couchdb:
+  # Main CouchDB container resources (applied by the subchart)
   resources:
     requests:
       cpu: "200m"
-      memory: "512Mi"
+      memory: "1Gi"
     limits:
       cpu: "2000m"
       memory: "2Gi"
+  # Backup job resources (already supported by Budibase top-level chart if you enable it)
+  # backup:
+  #   resources:
+  #     requests:
+  #       cpu: "50m"
+  #       memory: "64Mi"
+  #     limits:
+  #       cpu: "200m"
+  #       memory: "256Mi"
