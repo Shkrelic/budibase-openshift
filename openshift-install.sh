@@ -4,6 +4,7 @@
 # - Avoids writing to /etc/nginx by redirecting envsubst output to /tmp
 # - Makes nginx runtime dirs writable via volumes + fsGroup
 # - Passes args so nginx uses /tmp/nginx.conf (port 10000)
+# - Forces args via oc patch to avoid any fallback to port 80
 # - No cluster-admin or cluster-wide reads required
 
 set -Eeuo pipefail
@@ -194,6 +195,14 @@ if [[ -n "${FSGROUP}" ]]; then
 }
 JSON
 )" >/dev/null || echo -e "${YELLOW}Warning: fsGroup patch failed (SCC may inject it automatically or deny).${NC}"
+fi
+
+# Force the container args to use /tmp/nginx.conf (prevents any fallback to 80)
+echo -e "${YELLOW}Ensuring proxy uses /tmp/nginx.conf...${NC}"
+PATCH_JSON='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
+if ! oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null 2>&1; then
+  PATCH_JSON='[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
+  oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null
 fi
 
 # OpenShift Route
