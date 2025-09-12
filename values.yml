@@ -1,52 +1,88 @@
-# Minimal OpenShift compatibility configuration for Budibase
-# Only includes essential changes required for OpenShift
-
-global:
-  openshift: true
-
-# Critical security context settings for OpenShift
-proxy:
-  securityContext:
-    runAsNonRoot: true
-    allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
-
-# CouchDB configuration - critical for OpenShift
-couchdb:
-  securityContext:
-    runAsNonRoot: true
-    allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
-  containerSecurityContext:
-    runAsNonRoot: true
-    allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-      - ALL
-
-# Storage configuration
-couchdb:
-  persistence:
-    storageClass: "nfs"  # Options: nfs, thin, thin-csi
-redis:
-  master:
-    persistence:
-      storageClass: "nfs"  # Options: nfs, thin, thin-csi
-minio:
-  persistence:
-    storageClass: "nfs"  # Options: nfs, thin, thin-csi
-
-# Use Routes instead of Ingress for OpenShift
+# Disable Ingress; use an OpenShift Route instead (instructions below)
 ingress:
   enabled: false
 
-route:
-  enabled: true
-  host: budibase.apps.your-cluster-domain.com
-  tls:
-    termination: edge
-    insecureEdgeTerminationPolicy: Redirect
+services:
+  proxy:
+    # Mount the unprivileged hooks and wrapper
+    extraVolumes:
+      - name: nginx-unpriv
+        configMap:
+          name: budibase-nginx-unpriv
+          defaultMode: 0755
+    extraVolumeMounts:
+      # Pre-envsubst: send output to /tmp and set resolver
+      - name: nginx-unpriv
+        mountPath: /docker-entrypoint.d/15-openshift.envsh
+        subPath: 15-openshift.envsh
+      # Post-envsubst: remove IPv6 listen when IPv6 is unavailable
+      - name: nginx-unpriv
+        mountPath: /docker-entrypoint.d/80-listen-on-ipv6-by-default.sh
+        subPath: 80-listen-on-ipv6-by-default.sh
+      # Post-envsubst: patch pid + temp paths to /tmp
+      - name: nginx-unpriv
+        mountPath: /docker-entrypoint.d/90-openshift-unprivileged.sh
+        subPath: 90-openshift-unprivileged.sh
+      # Force nginx to use /tmp/nginx.conf (wrapper masks the real binary in PATH)
+      - name: nginx-unpriv
+        mountPath: /usr/local/bin/nginx
+        subPath: nginx-wrapper
+
+    # Resource requests/limits (required by OpenShift)
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+
+  apps:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+  worker:
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+  redis:
+    # If you’re using the bundled Redis
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "300m"
+        memory: "512Mi"
+
+  objectStore:
+    # If you’re using the bundled MinIO
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+
+# CouchDB subchart resources (applied to the Apache CouchDB chart)
+# Adjust if your cluster has different quotas. If the subchart rejects these keys,
+# consult the subchart docs and move these under the correct field names.
+couchdb:
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"

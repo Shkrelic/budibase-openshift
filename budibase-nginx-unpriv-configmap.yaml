@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: budibase-nginx-unpriv
+data:
+  15-openshift.envsh: |
+    #!/bin/sh
+    # Make envsubst write to a writable dir under restricted SCC.
+    export NGINX_ENVSUBST_OUTPUT_DIR="/tmp"
+
+    # Ensure nginx 'resolver' uses an IP (proxy_pass uses variables).
+    # If RESOLVER is unset or not an IP literal, derive from /etc/resolv.conf.
+    case "${RESOLVER:-}" in
+      ''|*[!0-9.:]*)
+        ns="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)"
+        if [ -n "$ns" ]; then
+          case "$ns" in *:*) ns="[$ns]";; esac
+          export RESOLVER="$ns"
+        fi
+        ;;
+    esac
+  80-listen-on-ipv6-by-default.sh: |
+    #!/bin/sh
+    # Remove IPv6 listen lines from rendered config if the node has no IPv6.
+    set -e
+    CONF="/tmp/nginx.conf"
+    if [ ! -f /proc/net/if_inet6 ] && [ -f "$CONF" ]; then
+      sed -i '/listen  \[::\]/d' "$CONF" || true
+      echo "[openshift] IPv6 disabled; removed IPv6 listen lines from $CONF"
+    fi
+  90-openshift-unprivileged.sh: |
+    #!/bin/sh
+    # Patch rendered /tmp/nginx.conf for unprivileged runtime paths.
+    set -e
+    CONF="/tmp/nginx.conf"
+
+    # Ensure /tmp temp dirs exist and are world-writable
+    mkdir -p /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp
+    chmod 0777 /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp || true
+
+    if [ -f "$CONF" ]; then
+      # pid to /tmp
+      if grep -qE '^[[:space:]]*pid[[:space:]]+' "$CONF"; then
+        sed -i -E 's|^[[:space:]]*pid[[:space:]]+.*;|pid                     /tmp/nginx.pid;|' "$CONF" || true
+      else
+        sed -i '1i pid                     /tmp/nginx.pid;' "$CONF" || true
+      fi
+
+      # Inject temp paths inside http { } once
+      if ! grep -q 'client_body_temp_path /tmp/client_temp;' "$CONF"; then
+        sed -i '/http {/a \
+        # Temp paths for OpenShift arbitrary UID\
+        client_body_temp_path /tmp/client_temp;\
+        proxy_temp_path       /tmp/proxy_temp;\
+        fastcgi_temp_path     /tmp/fastcgi_temp;\
+        uwsgi_temp_path       /tmp/uwsgi_temp;\
+        scgi_temp_path        /tmp/scgi_temp;' "$CONF" || true
+      fi
+      echo "[openshift] Patched $CONF for unprivileged runtime paths."
+    else
+      echo "[openshift] WARNING: $CONF not found."
+    fi
+  nginx-wrapper: |
+    #!/bin/sh
+    # Wrapper to force nginx to use the rendered /tmp/nginx.conf
+    # docker-entrypoint will exec "nginx -g 'daemon off;'" which resolves to this wrapper first.
+    set -e
+    exec /usr/sbin/nginx -c /tmp/nginx.conf "$@"
