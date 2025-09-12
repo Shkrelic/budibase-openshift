@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Budibase on OpenShift installer (restricted SCC friendly)
+# Budibase on OpenShift installer (restricted SCC friendly) - v9 fixed
 # - Keeps Budibase Helm chart vanilla
 # - Avoids writing to /etc/nginx by redirecting envsubst output to /tmp
 # - Makes nginx runtime dirs writable via volumes + fsGroup
-# - Patches proxy deployment args so nginx uses /tmp/nginx.conf (port 10000)
-# - No cluster-admin required
+# - Passes args so nginx uses /tmp/nginx.conf (port 10000)
+# - No cluster-admin or cluster-wide reads required
 
 set -Eeuo pipefail
 
@@ -12,8 +12,8 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC
 RELEASE_NAME="${RELEASE_NAME:-budibase}"
 NAMESPACE="${NAMESPACE:-budibase}"
 
-echo -e "${BLUE}Budibase OpenShift Installer${NC}"
-echo -e "${YELLOW}================================${NC}"
+echo -e "${BLUE}Budibase OpenShift Installer (v9 fixed)${NC}"
+echo -e "${YELLOW}======================================${NC}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}Missing '$1'.${NC}"; exit 1; }; }
 need oc; need helm
@@ -57,17 +57,6 @@ if [[ -z "${APPS_DOMAIN}" ]]; then
 fi
 echo -e "${GREEN}Using apps domain: ${APPS_DOMAIN}${NC}"
 
-# Detect DNS resolver IP for nginx
-detect_dns_resolver_ip() {
-  local ip=""
-  ip="$(oc get svc dns-default -n openshift-dns -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-  [[ -z "${ip}" ]] && ip="$(oc get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-  [[ -z "${ip}" ]] && ip="$(oc get svc coredns -n kube-system -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
-  echo -n "${ip}"
-}
-RESOLVER_IP="$(detect_dns_resolver_ip)"
-[[ -n "${RESOLVER_IP}" ]] && echo -e "${GREEN}Detected cluster DNS: ${RESOLVER_IP}${NC}" || echo -e "${YELLOW}Resolver not detected; using chart default.${NC}"
-
 # Detect default StorageClass
 detect_storage_class() {
   local def any
@@ -96,13 +85,9 @@ detect_fsGroup() {
   fi
 }
 FSGROUP="$(detect_fsGroup)"
-if [[ -z "${FSGROUP}" ]]; then
-  echo -e "${YELLOW}Could not detect a namespace fsGroup range. Proceeding without fsGroup patch; volume writes may fail.${NC}"
-else
-  echo -e "${GREEN}Using fsGroup: ${FSGROUP}${NC}"
-fi
+[[ -n "${FSGROUP}" ]] && echo -e "${GREEN}Using fsGroup: ${FSGROUP}${NC}" || echo -e "${YELLOW}fsGroup not detected; proceeding.${NC}"
 
-# ConfigMap hooks
+# Hooks: envsubst to /tmp and resolver IP from /etc/resolv.conf; IPv6 cleanup if needed
 echo -e "${YELLOW}Creating nginx OpenShift hook ConfigMap...${NC}"
 cat <<'EOF' | oc apply -n "${NAMESPACE}" -f -
 apiVersion: v1
@@ -112,23 +97,30 @@ metadata:
 data:
   15-openshift.envsh: |
     #!/bin/sh
-    # Make envsubst write to writable /tmp instead of /etc/nginx
+    # Write rendered config to /tmp (writable under restricted SCC)
     export NGINX_ENVSUBST_OUTPUT_DIR="/tmp"
+    # Ensure nginx 'resolver' uses an IP, since proxy_pass uses variables.
+    case "${RESOLVER:-}" in
+      ''|*[!0-9.:]*)
+        ns="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)"
+        if [ -n "$ns" ]; then
+          case "$ns" in *:*) ns="[$ns]";; esac
+          export RESOLVER="$ns"
+        fi
+        ;;
+    esac
   85-openshift-ipv6-off.sh: |
     #!/bin/sh
     set -e
     CONF="/tmp/nginx.conf"
-    # If IPv6 is not available, remove IPv6 listen statements from rendered config
-    if [ ! -f /proc/net/if_inet6 ]; then
-      if [ -f "$CONF" ]; then
-        sed -i '/listen  \[::\]/d' "$CONF" || true
-        echo "[openshift] IPv6 disabled; removed IPv6 listen lines from $CONF"
-      fi
+    if [ ! -f /proc/net/if_inet6 ] && [ -f "$CONF" ]; then
+      sed -i '/listen  \[::\]/d' "$CONF" || true
+      echo "[openshift] IPv6 disabled; removed IPv6 listen lines from $CONF"
     fi
 EOF
 echo -e "${GREEN}ConfigMap created/updated.${NC}"
 
-# Generate Helm values override (volumes + mounts only; NO args here)
+# Generate Helm values override (volumes, mounts, args, storage)
 VALUES_FILE="$(mktemp -t bb-values-XXXXXXXX.yaml)"
 echo -e "${YELLOW}Generating Helm values override: ${VALUES_FILE}${NC}"
 
@@ -152,15 +144,12 @@ services:
       - name: run-volume
         emptyDir: {}
     extraVolumeMounts:
-      # Hook to set NGINX_ENVSUBST_OUTPUT_DIR before 20-envsubst runs
       - name: nginx-unpriv
         mountPath: /docker-entrypoint.d/15-openshift.envsh
         subPath: 15-openshift.envsh
-      # Hook after envsubst (optional IPv6 cleanup on rendered /tmp/nginx.conf)
       - name: nginx-unpriv
         mountPath: /docker-entrypoint.d/85-openshift-ipv6-off.sh
         subPath: 85-openshift-ipv6-off.sh
-      # Writable dirs for runtime
       - name: tmp-volume
         mountPath: /tmp
       - name: cache-volume
@@ -169,18 +158,12 @@ services:
         mountPath: /var/log/nginx
       - name: run-volume
         mountPath: /var/run
-EOF
-
-# Optional resolver override (quoted)
-if [[ -n "${RESOLVER_IP}" ]]; then
-  {
-    echo ""
-    echo "    resolver: \"${RESOLVER_IP}\""
-  } >> "${VALUES_FILE}"
-fi
-
-# Storage classes for subcharts/services
-cat >> "${VALUES_FILE}" <<EOF
+    args:
+      - nginx
+      - -c
+      - /tmp/nginx.conf
+      - -g
+      - daemon off;
 
   objectStore:
     storageClass: "${STORAGE_CLASS}"
@@ -203,35 +186,15 @@ echo -e "${YELLOW}Deploying Budibase (Helm) to namespace ${NAMESPACE}...${NC}"
 helm upgrade --install "${RELEASE_NAME}" budibase/budibase -n "${NAMESPACE}" -f "${VALUES_FILE}"
 echo -e "${GREEN}Helm release applied.${NC}"
 
-# Patch fsGroup so emptyDir mounts are writable by the arbitrary UID
+# Best-effort: patch fsGroup so mounted dirs are writable by arbitrary UID
 if [[ -n "${FSGROUP}" ]]; then
-  echo -e "${YELLOW}Patching proxy deployment with fsGroup ${FSGROUP}...${NC}"
   oc patch deploy/proxy-service -n "${NAMESPACE}" --type merge -p "$(cat <<JSON
 {
-  "spec": {
-    "template": {
-      "spec": {
-        "securityContext": {
-          "fsGroup": ${FSGROUP},
-          "fsGroupChangePolicy": "OnRootMismatch"
-        }
-      }
-    }
-  }
+  "spec": { "template": { "spec": { "securityContext": { "fsGroup": ${FSGROUP}, "fsGroupChangePolicy": "OnRootMismatch" } } } }
 }
 JSON
 )" >/dev/null || echo -e "${YELLOW}Warning: fsGroup patch failed (SCC may inject it automatically or deny).${NC}"
 fi
-
-# CRITICAL: ensure nginx uses /tmp/nginx.conf (port 10000) instead of default (port 80)
-echo -e "${YELLOW}Patching proxy container args to use /tmp/nginx.conf...${NC}"
-PATCH_JSON='[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
-if ! oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null 2>&1; then
-  # fallback if args field not present yet
-  PATCH_JSON='[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/tmp/nginx.conf","-g","daemon off;"]}]'
-  oc patch deploy/proxy-service -n "${NAMESPACE}" --type='json' -p "${PATCH_JSON}" >/dev/null
-fi
-echo -e "${GREEN}Patched container args.${NC}"
 
 # OpenShift Route
 ROUTE_HOST="budibase.${APPS_DOMAIN}"
@@ -272,7 +235,7 @@ echo -e "${YELLOW}Note: It can take a few minutes for all pods to fully initiali
 echo -e "${BLUE}Troubleshooting Tips:${NC}"
 echo -e "  - Proxy logs:   oc logs deploy/proxy-service -n ${NAMESPACE}"
 echo -e "  - Verify args:  oc get deploy/proxy-service -n ${NAMESPACE} -o jsonpath='{.spec.template.spec.containers[0].args}'"
-echo -e "  - Inspect conf: oc rsh deploy/proxy-service -- grep -E 'listen|pid|access_log' /tmp/nginx.conf | sed -n '1,120p'"
+echo -e "  - Inspect conf: oc rsh deploy/proxy-service -- sed -n '1,60p' /tmp/nginx.conf"
 echo -e "  - Pods:         oc get pods -n ${NAMESPACE}"
 echo -e "  - Events:       oc get events -n ${NAMESPACE} --sort-by=.lastTimestamp | tail -n 50"
 echo -e "  - Route:        oc get route ${RELEASE_NAME} -n ${NAMESPACE} -o wide"
